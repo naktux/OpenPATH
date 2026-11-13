@@ -1,10 +1,23 @@
 import { parse } from 'java-parser';
 
 export type Step = { id: string; kind: 'call'|'group'; name: string; args: string[]; children: Step[]; decorators: {name:string;args:string[]}[] };
-export type Waypoint = {id:string;name:string;x:number;y:number;heading:number};
+export type Waypoint = {id:string;number?:number;name:string;x:number;y:number;heading:number};
 export type Sequence = {id:string;name:string;steps:Step[]};
 export type Routine = Sequence & {isDefault:boolean};
-export type Project = {version:1;name:string;source:string;waypoints:Waypoint[];commands:Sequence[];routines:Routine[];robot:{length:number;width:number;front:number};calibration:{originX:number;originY:number;pixelsPerMeterX:number;pixelsPerMeterY:number;imageWidth:number;imageHeight:number}};
+export type Project = {version:1;nextWaypointNumber?:number;name:string;source:string;waypoints:Waypoint[];commands:Sequence[];routines:Routine[];robot:{length:number;width:number;front:number};calibration:{originX:number;originY:number;pixelsPerMeterX:number;pixelsPerMeterY:number;imageWidth:number;imageHeight:number}};
+// Numeric IDs are project metadata, independent of Java names and execution order.
+export function nextWaypointNumber(p:Pick<Project,'waypoints'|'nextWaypointNumber'>){
+ return Math.max(1,Number.isSafeInteger(p.nextWaypointNumber)&&p.nextWaypointNumber!>0?p.nextWaypointNumber!:1,...p.waypoints.map(w=>Number.isSafeInteger(w.number)&&w.number!>0?w.number!+1:1));
+}
+export function ensureWaypointNumbers(p:Project){
+ const used=new Set<number>();
+ for(const w of p.waypoints)if(w.number!==undefined){if(!Number.isSafeInteger(w.number)||w.number<1||used.has(w.number))throw Error('Waypoint IDs must be unique positive integers.');used.add(w.number);}
+ let next=nextWaypointNumber(p);
+ for(const w of p.waypoints)if(w.number===undefined)w.number=next++;
+ p.nextWaypointNumber=next;
+ return p;
+}
+export function claimWaypointNumber(p:Project){ensureWaypointNumbers(p);const number=p.nextWaypointNumber!;if(!Number.isSafeInteger(number))throw Error('Waypoint ID limit reached.');p.nextWaypointNumber=number+1;return number;}
 export const uid=()=>crypto.randomUUID();
 export const calibration={originX:92,originY:731,pixelsPerMeterX:(1497-92)/16.541,pixelsPerMeterY:(731-47)/8.069,imageWidth:1601,imageHeight:779};
 export const toPixel=(x:number,y:number,c=calibration)=>({x:c.originX+x*c.pixelsPerMeterX,y:c.originY-y*c.pixelsPerMeterY});
@@ -29,14 +42,16 @@ export function methods(source:string){const out:Method[]=[];const m=mask(source
 function registrations(source:string){const list:{name:string;expression:string;isDefault:boolean;start:number;end:number}[]=[];const m=mask(source);for(const r of m.matchAll(/m_chooser\.(addOption|setDefaultOption)\s*\(/g)){const a=m.indexOf('(',r.index),b=closeAt(source,a),args=splitArgs(source.slice(a+1,b));list.push({name:JSON.parse(args[0]),expression:args[1],isDefault:r[1]==='setDefaultOption',start:r.index!,end:source.indexOf(';',b)+1});}return list;}
 const waypointRE=/waypoints\.put\(\s*positions\.(\w+)\s*,\s*new Pose2d\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*Rotation2d\.fromDegrees\(\s*([-\d.]+)\s*\)\s*\)\s*\)\s*;/g;
 export function importJava(source:string):Project{
- parse(source);const waypoints=[...source.matchAll(waypointRE)].map(m=>({id:uid(),name:m[1],x:+m[2],y:+m[3],heading:+m[4]}));if(!waypoints.length)throw Error('No supported waypoint definitions found. Expected waypoints.put(positions.Name, new Pose2d(x, y, Rotation2d.fromDegrees(angle))).');
+ parse(source);const waypoints=[...source.matchAll(waypointRE)].map((m,index)=>({id:uid(),number:index+1,name:m[1],x:+m[2],y:+m[3],heading:+m[4]}));if(!waypoints.length)throw Error('No supported waypoint definitions found. Expected waypoints.put(positions.Name, new Pose2d(x, y, Rotation2d.fromDegrees(angle))).');
  const all=methods(source);const commands:Sequence[]=[];
  for(const method of all){const body=source.slice(method.bodyStart,method.bodyEnd);const normalized=clean(body);if(!method.params.trim()&&/^return\s+new SequentialCommandGroup\s*\(/.test(normalized)){const expr=normalized.replace(/^return\s+/,'').replace(/;\s*$/,'');const n=parseStep(expr);if(n.decorators.length)throw Error('Decorated reusable sequence requires explicit support: '+method.name);commands.push({id:uid(),name:method.name,steps:n.children});}}
  const routines=registrations(source).map(r=>{const node=parseStep(r.expression);return {id:uid(),name:r.name,isDefault:r.isDefault,steps:node.name==='SequentialCommandGroup'&&!node.decorators.length?node.children:[node]};});if(!routines.length)throw Error('No m_chooser registrations found.');
- return {version:1,name:'REBUILT Autonomous',source,waypoints,commands,routines,robot:{length:.9,width:.9,front:0},calibration:{...calibration}};
+ return {version:1,nextWaypointNumber:waypoints.length+1,name:'REBUILT Autonomous',source,waypoints,commands,routines,robot:{length:.9,width:.9,front:0},calibration:{...calibration}};
 }
 export const walk=(steps:Step[]):Step[]=>steps.flatMap(n=>[n,...walk(n.children)]);
 export function validate(p:Project){const errors:string[]=[];const names=[...p.waypoints.map(w=>w.name),...p.commands.map(c=>c.name)];for(const n of names)if(!/^[A-Za-z_$][\w$]*$/.test(n)||/^(class|public|private|return|new|void|int|double|enum|static|default|switch|case|if|else|while|for|true|false|null|this|super|final|package|import|protected|abstract|boolean|byte|char|long|float|short|try|catch|throw|throws|extends|implements|interface|record|var|yield)$/.test(n))errors.push('Invalid Java identifier: '+n);
+ const waypointNumbers=p.waypoints.map(w=>w.number).filter(n=>n!==undefined);
+ if(waypointNumbers.some(n=>!Number.isSafeInteger(n)||n!<1)||new Set(waypointNumbers).size!==waypointNumbers.length)errors.push('Waypoint IDs must be unique positive integers.');
  for(const list of [p.waypoints,p.commands,p.routines])if(new Set(list.map(x=>x.name)).size!==list.length)errors.push('Duplicate names in project.');
  if(!p.routines.length)errors.push('At least one routine is required.');if(p.routines.filter(r=>r.isDefault).length!==1)errors.push('Exactly one default routine is required.');
  for(const w of p.waypoints)if(![w.x,w.y,w.heading].every(Number.isFinite))errors.push('Invalid pose: '+w.name);
@@ -53,5 +68,5 @@ export function exportJava(p:Project){const errors=validate(p);if(errors.length)
  regs.forEach((r,i)=>edits.push({start:r.start,end:r.end,text:p.routines[i]?registration(p.routines[i]):''}));const extras=p.routines.slice(regs.length).map(registration).join('\n        ');if(extras)edits.push({start:chooser.bodyStart,end:chooser.bodyStart,text:'\n        '+extras+'\n'});if(added)edits.push({start:src.lastIndexOf('}'),end:src.lastIndexOf('}'),text:added});
  let result=src;for(const e of edits.sort((a,b)=>b.start-a.start))result=result.slice(0,e.start)+e.text+result.slice(e.end);parse(result);return result;
 }
-export function projectFromJSON(text:string):Project{const p=JSON.parse(text);if(p.version!==1||typeof p.source!=='string'||typeof p.name!=='string'||!Array.isArray(p.waypoints)||!Array.isArray(p.commands)||!Array.isArray(p.routines)||!p.robot||!p.calibration)throw Error('Unsupported or incomplete OpenPATH project.');const c=p.calibration;if(![c.originX,c.originY,c.pixelsPerMeterX,c.pixelsPerMeterY,c.imageWidth,c.imageHeight].every(Number.isFinite)||c.pixelsPerMeterX<=0||c.pixelsPerMeterY<=0||c.imageWidth!==1601||c.imageHeight!==779)throw Error('Invalid calibration or incompatible field image.');const errors=validate(p);if(errors.length)throw Error(errors.join('\n'));exportJava(p);return p;}
+export function projectFromJSON(text:string):Project{const p=JSON.parse(text);if(p.version!==1||typeof p.source!=='string'||typeof p.name!=='string'||!Array.isArray(p.waypoints)||!Array.isArray(p.commands)||!Array.isArray(p.routines)||!p.robot||!p.calibration)throw Error('Unsupported or incomplete OpenPATH project.');ensureWaypointNumbers(p);const c=p.calibration;if(![c.originX,c.originY,c.pixelsPerMeterX,c.pixelsPerMeterY,c.imageWidth,c.imageHeight].every(Number.isFinite)||c.pixelsPerMeterX<=0||c.pixelsPerMeterY<=0||c.imageWidth!==1601||c.imageHeight!==779)throw Error('Invalid calibration or incompatible field image.');const errors=validate(p);if(errors.length)throw Error(errors.join('\n'));exportJava(p);return p;}
 export function newCall(name='driveTo',args=['positions.StartLeft','0.1']):Step{return {id:uid(),kind:'call',name,args,children:[],decorators:[]};}
